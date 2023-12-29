@@ -19,7 +19,7 @@ with install_import_hook("gpjax", "beartype.beartype"):
 # Enable Float64 for more stable matrix inversions.
 config.update("jax_enable_x64", True)
 # Throw error if any of the jax operations evaluate to nan.
-config.update("jax_debug_nans", True)
+# config.update("jax_debug_nans", True)
 
 # random seed
 key = jr.PRNGKey(42)
@@ -88,12 +88,14 @@ class Node:
         )  # number of trainable parameter
 
         if n_data is not None:
-            self.n_data = np.log(n_data)
+            self.log_n_data = np.log(n_data)
 
         if max_log_likelihood is not None:
             self.max_log_likelihood = max_log_likelihood
-            if self.n_data is not None:
-                self.bic = self.n_parameter * self.n_data - 2 * self.max_log_likelihood
+            if self.log_n_data is not None:
+                self.bic = (
+                    self.n_parameter * self.log_n_data - 2 * self.max_log_likelihood
+                )
 
     def add_child(
         self,
@@ -173,7 +175,7 @@ class KernelSearch:
                 num_datapoints=len(X), obs_stddev=obs_stddev
             )
             likelihood = likelihood.replace_trainable(
-                obs_stddev=fit_obs_stddev
+                obs_stddev=fit_obs_stddev  # type: ignore
             )  # type: ignore
         if objective is None:
             objective = jit(gpx.objectives.ConjugateLOOCV(negative=True))
@@ -182,7 +184,11 @@ class KernelSearch:
 
         self.likelihood = likelihood
         self.objective = objective
-        self.data = gpx.Dataset(X=X, y=y)
+
+        self.data = gpx.Dataset(
+            X=X.reshape(-1, 1) if X.ndim == 1 else X,
+            y=y.reshape(-1, 1) if y.ndim == 1 else y,
+        )
         self.kernel_library = kernel_library
 
         self.fitting_mode = fitting_mode
@@ -219,8 +225,8 @@ class KernelSearch:
             Constant kernel.
         """
         return gpx.kernels.Constant(constant=jnp.array(1.0)).replace_trainable(
-            constant=trainable
-        )  # type: ignore
+            constant=trainable  # type: ignore
+        )
 
     def fit(
         self, posterior: gpx.gps.AbstractPosterior
@@ -250,7 +256,7 @@ class KernelSearch:
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 optimized_posterior, history = gpx.fit_scipy(
                     model=posterior,
-                    objective=self.objective,
+                    objective=self.objective,  # type: ignore
                     train_data=self.data,
                     max_iters=self.num_iters,
                     verbose=self.verbosity >= 2,
@@ -266,7 +272,7 @@ class KernelSearch:
             )
             optimized_posterior, history = gpx.fit(
                 model=posterior,
-                objective=self.objective,
+                objective=self.objective,  # type: ignore
                 train_data=self.data,
                 optim=optim,
                 key=key,
@@ -277,6 +283,9 @@ class KernelSearch:
             raise ValueError("'fitting_mode' must be 'scipy' or 'adam'.")
 
         max_log_likelihood = -float(history[-1])
+        if not np.isfinite(max_log_likelihood):
+            max_log_likelihood = -np.inf
+
         return optimized_posterior, max_log_likelihood
 
     def expand_node(self, node: Node) -> None:
@@ -307,8 +316,8 @@ class KernelSearch:
                     # have one multiplicative constant per term
                     try:
                         new_kernel = new_kernel.replace_trainable(
-                            variance=False
-                        )  # type: ignore
+                            variance=False  # type: ignore
+                        )
                     except ValueError:
                         pass
 
@@ -371,13 +380,13 @@ class KernelSearch:
         list[Node]
             Sorted list of top nodes.
         """
-        sorted_tuple = sorted((node.bic, node) for node in layer)
+        # sort with id in tuple, so that no errors is thrown if multiple
+        # BIC are the same
+        sorted_tuple = sorted((node.bic, id(node), node) for node in layer)
         # return first n_leafs nodes
-        top_nodes = [node for _, node in sorted_tuple][:n_leafs]
+        top_nodes = [node for _, _, node in sorted_tuple][:n_leafs]
         # filter for bic threshold
-        top_nodes = [node for node in top_nodes if node.bic < bic_threshold]
-        if top_nodes:
-            self.best_model = top_nodes[0]
+        # top_nodes = [node for node in top_nodes if node.bic < bic_threshold]
         return top_nodes
 
     def expand_layer(
@@ -406,6 +415,7 @@ class KernelSearch:
         self,
         depth: int = 10,
         n_leafs: int = 3,
+        patience: int = 1,
     ) -> gpx.gps.AbstractPosterior:
         """Search for the best kernel fitting the data
         by performing a greedy search through possible kernel
@@ -423,6 +433,9 @@ class KernelSearch:
         n_leafs : int, optional
             The number of kernels to keep and expand at each layer. Top
             kernels are chosen based on BIC, by default 3
+        patience : int, optional
+            Number of layers to calculate without improving before early
+            stopping, by default 1
 
         Returns
         -------
@@ -431,30 +444,41 @@ class KernelSearch:
         """
         layer = self.root
 
+        best_model = None
         current_depth = 0
         bic_threshold = np.inf
+        patience_counter = 0
         for current_depth in range(depth):
             # fit and compute BIC at current layer
             self.compute_layer(layer, current_depth)
             if current_depth == 0:
-                best_model = sorted((node.bic, node) for node in layer)[0][1]
+                best_model = sorted((node.bic, id(node), node) for node in layer)[0][-1]
 
             # calculate and sort BICs
             current_bics = sorted([node.bic for node in layer])
             if self.verbosity >= 1:
                 print(f"Layer {current_depth+1} || Current BICs: {current_bics}")
 
+            # select best mdeols
+            layer = self.select_top_nodes(layer, bic_threshold, n_leafs)
+
             # Early stopping if no more improvements are found
             if current_bics[0] > bic_threshold:
-                if self.verbosity >= 1:
-                    print("No more improvements found! Terminating early..\n")
+                if patience_counter >= patience:
+                    if self.verbosity >= 1:
+                        print("No more improvements found! Terminating early..\n")
                     break
+                patience_counter += 1
+            else:
+                best_model = layer[0]
+                bic_threshold = current_bics[0]  # min bic of current layer
+                patience_counter = 0
 
             # expand tree and search for new top noded in next layer down
-            layer = self.select_top_nodes(layer, bic_threshold, n_leafs)
-            bic_threshold = current_bics[0]  # min bic of current layer
-            best_model = layer[0]
             layer = self.expand_layer(layer)
+
+        if best_model is None:
+            raise ValueError("Loop did not run. Is depth>0?")
 
         if self.verbosity >= 1:
             print(f"Terminated on layer: {current_depth+1}.")
