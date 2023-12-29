@@ -1,18 +1,15 @@
 from dataclasses import dataclass
 
-from beartype.typing import Union
 import jax.numpy as jnp
-from jaxtyping import Float
 import tensorflow_probability.substrates.jax.bijectors as tfb
-import tensorflow_probability.substrates.jax.distributions as tfd
-
+from beartype.typing import Union
 from gpjax.base import param_field
 from gpjax.kernels.base import AbstractKernel
-from gpjax.kernels.stationary.utils import squared_distance
-from gpjax.typing import (
-    Array,
-    ScalarFloat,
-)
+from gpjax.typing import Array, ScalarFloat
+from jaxtyping import Float
+
+# flake8: noqa: F722 # ignore typing error for jax, not supported by flake8
+
 
 @dataclass
 class OrnsteinUhlenbeck(AbstractKernel):
@@ -24,7 +21,11 @@ class OrnsteinUhlenbeck(AbstractKernel):
     variance: ScalarFloat = param_field(jnp.array(1.0), bijector=tfb.Softplus())
     name: str = "OU"
 
-    def __call__(self, x: Float[Array, " D"], y: Float[Array, " D"]) -> ScalarFloat:
+    def __call__(
+        self,
+        x: Float[Array, " D"],  # type: ignore
+        y: Float[Array, " D"],  # type: ignore
+    ) -> ScalarFloat:
         r"""Compute the OU kernel between a pair of arrays.
 
         Evaluate the kernel on a pair of inputs $`(x, y)`$ with lengthscale parameter
@@ -34,8 +35,10 @@ class OrnsteinUhlenbeck(AbstractKernel):
         ```
 
         Args:
-            x (Float[Array, " D"]): The left hand argument of the kernel function's call.
-            y (Float[Array, " D"]): The right hand argument of the kernel function's call.
+            x (Float[Array, " D"]): The left hand argument of the kernel
+            function's call.
+            y (Float[Array, " D"]): The right hand argument of the kernel
+            function's call.
 
         Returns:
             ScalarFloat: The value of $`k(x, y)`$.
