@@ -8,6 +8,7 @@ import numpy as np
 import optax as ox
 from gpjax.base import meta_leaves
 from jax import config, jit, tree_map
+from jax.flatten_util import ravel_pytree
 from jax.stages import Wrapped
 from jaxtyping import Array, install_import_hook
 from numpy.typing import NDArray
@@ -75,19 +76,20 @@ class Node:
         """
         self.posterior = posterior
 
-        try:
-            leaves = meta_leaves(
-                posterior.prior.kernel.flattened_kernels  # type: ignore
-            )
-        except AttributeError:
-            leaves = meta_leaves(posterior.prior.kernel)
-        self.n_parameter = sum(
-            leaf[0]["trainable"] for leaf in leaves if isinstance(leaf[0], dict)
-        )  # number of trainable parameter
-        # add std, if its being fit
-        self.n_parameter += meta_leaves(posterior.likelihood)[0][0][  # type: ignore
-            "trainable"
-        ]
+        # try:
+        #     leaves = meta_leaves(
+        #         posterior.prior.kernel.flattened_kernels  # type: ignore
+        #     )
+        # except AttributeError:
+        #     leaves = meta_leaves(posterior.prior.kernel)
+        # self.n_parameter = sum(
+        #     leaf[0]["trainable"] for leaf in leaves if isinstance(leaf[0], dict)
+        # )  # number of trainable parameter
+        # # add std, if its being fit
+        # self.n_parameter += meta_leaves(posterior.likelihood)[0][0][  # type: ignore
+        #     "trainable"
+        # ]
+        self.n_parameter = sum(ravel_pytree(posterior.trainables())[0])
 
         if max_log_likelihood is not None:
             self.max_log_likelihood = max_log_likelihood

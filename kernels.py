@@ -8,6 +8,7 @@ from gpjax.base import param_field, static_field
 from gpjax.kernels.base import AbstractKernel
 from gpjax.typing import Array, ScalarFloat
 from jaxtyping import Float
+from gpjax.base import static_field
 
 # flake8: noqa: F722 # ignore typing error for jax, not supported by flake8
 
@@ -34,7 +35,7 @@ class CombinationKernel(AbstractKernel):
             else:
                 kernels_list.append(kernel)
 
-        self.flattened_kernels = kernels_list
+        # self.kernels = kernels_list
 
     def __call__(
         self,
