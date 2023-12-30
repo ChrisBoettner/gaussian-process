@@ -12,6 +12,9 @@ from jax.stages import Wrapped
 from jaxtyping import Array, install_import_hook
 from numpy.typing import NDArray
 from tqdm import tqdm
+from gpjax.fit import FailedScipyFitError
+
+from kernels import CombinationKernel, ProductKernel, SumKernel
 
 with install_import_hook("gpjax", "beartype.beartype"):
     import gpjax as gpx
@@ -30,7 +33,6 @@ class Node:
         self,
         posterior: gpx.gps.AbstractPosterior,
         max_log_likelihood: Optional[float] = None,
-        n_data: Optional[int] = None,
         parent: Optional["Node"] = None,
     ) -> None:
         """Node of the search tree, containg the posterior
@@ -42,9 +44,6 @@ class Node:
             The gpjax posterior model.
         max_log_likelihood : Optional[float], optional
              The log likelihood found after fittng, by default None
-        n_data : Optional[int], optional
-            The number of datapoints used during training. Needed
-            to calculate BIC, by default None
         parent : Optional[Node], optional
             Parent node in the search tree, by default None
         """
@@ -54,19 +53,17 @@ class Node:
         self.update(
             posterior,
             max_log_likelihood,
-            n_data,
         )
 
     def update(
         self,
         posterior: gpx.gps.AbstractPosterior,
         max_log_likelihood: Optional[float] = None,
-        n_data: Optional[int] = None,
     ) -> None:
         """Update the new by setting new posterior,
         max_log_likelihood and n_posterior.
         Automatically calculates n_parameter from the model,
-        and BIC if max_log_likelihood and n_data is available,
+        and AIC if max_log_likelihood  is available.
 
         Parameters
         ----------
@@ -74,28 +71,27 @@ class Node:
             The gpjax posterior model.
         max_log_likelihood : Optional[float], optional
              The log likelihood found after fittng, by default None
-        n_data : Optional[int], optional
-            The number of datapoints used during training. Needed
-            to calculate BIC, by default None
         parent : Optional[Node], optional
         """
         self.posterior = posterior
 
+        try:
+            leaves = meta_leaves(
+                posterior.prior.kernel.flattened_kernels  # type: ignore
+            )
+        except AttributeError:
+            leaves = meta_leaves(posterior.prior.kernel)
         self.n_parameter = sum(
-            leaf[0]["trainable"]
-            for leaf in meta_leaves(posterior)
-            if isinstance(leaf[0], dict)
+            leaf[0]["trainable"] for leaf in leaves if isinstance(leaf[0], dict)
         )  # number of trainable parameter
-
-        if n_data is not None:
-            self.log_n_data = np.log(n_data)
+        # add std, if its being fit
+        self.n_parameter += meta_leaves(posterior.likelihood)[0][0][  # type: ignore
+            "trainable"
+        ]
 
         if max_log_likelihood is not None:
             self.max_log_likelihood = max_log_likelihood
-            if self.log_n_data is not None:
-                self.bic = (
-                    self.n_parameter * self.log_n_data - 2 * self.max_log_likelihood
-                )
+            self.aic = self.n_parameter * 2 - 2 * self.max_log_likelihood
 
     def add_child(
         self,
@@ -149,7 +145,7 @@ class KernelSearch:
             given by obs_stddev.
         objective : Optional[gpx.objectives.AbstractObjective  |  Wrapped], optional
             The objective function used to evalute the quality of a fit. By default
-            None, which defaults to the jit-compiled leave-one-out predictive
+            None, which defaults to the jit-compiled marginal log likelihood.
             probability.
         mean_function : Optional[gpx.mean_functions.AbstractMeanFunction], optional
             The mean function of the Gaussian process. By default None, which
@@ -178,7 +174,7 @@ class KernelSearch:
                 obs_stddev=fit_obs_stddev  # type: ignore
             )  # type: ignore
         if objective is None:
-            objective = jit(gpx.objectives.ConjugateLOOCV(negative=True))
+            objective = jit(gpx.objectives.ConjugateMLL(negative=True))
         if mean_function is None:
             mean_function = gpx.mean_functions.Zero()
 
@@ -202,31 +198,57 @@ class KernelSearch:
                 likelihood
                 * gpx.gps.Prior(
                     mean_function=mean_function,
-                    kernel=self._const_kernel() * kernel,
+                    kernel=kernel,
                 )
             )
             for kernel in (kernel_library if root_kernel is None else [root_kernel])
         ]
 
     @staticmethod
-    def _const_kernel(trainable: bool = False) -> gpx.kernels.Constant:
-        """Create constant kernel. Used for tracking the different terms
-        in the composite kernel.
+    def _kernel_name(kernel: gpx.kernels.AbstractKernel) -> str:
+        """Generate string description of current kernel. Only
+        works with the specific type of structure created in
+        kernel tree search.
 
         Parameters
         ----------
-        trainable : bool, optional
-            Choose wether the constant should be learned during
-            fitting, by default False
+        kernel : AbstractKernel
+            The kernel.
 
         Returns
         -------
-        gpx.kernels.Constant
-            Constant kernel.
+        str
+            String description of kernel.
         """
-        return gpx.kernels.Constant(constant=jnp.array(1.0)).replace_trainable(
-            constant=trainable  # type: ignore
-        )
+        if hasattr(kernel, "kernels"):
+            assert isinstance(kernel.kernels, list)  # type: ignore
+            name = ""
+
+            for term in kernel.kernels:  # type: ignore
+                if isinstance(term, CombinationKernel):
+                    for k in term.kernels:  # type: ignore
+                        try:
+                            name += "Const" if hasattr(k, "constant") else f"{k.name}"
+                        except AttributeError:
+                            raise ValueError("Kernel structure not understood - 1.")
+                        if k != term.kernels[-1]:  # type: ignore
+                            name += " * "
+                else:
+                    name = name + f"{term.name}"
+
+                if term != kernel.kernels[-1]:  # type: ignore
+                    if kernel.operator == jnp.sum:  # type: ignore
+                        name += " + "
+                    elif kernel.operator == jnp.prod:  # type: ignore
+                        name += " * "
+                    else:
+                        raise ValueError("Kernel structure not understood - 2.")
+
+        elif hasattr(kernel, "name"):
+            name = kernel.name
+        else:
+            raise ValueError("Kernel structure not understood - 3.")
+        return name
 
     def fit(
         self, posterior: gpx.gps.AbstractPosterior
@@ -254,13 +276,17 @@ class KernelSearch:
         if self.fitting_mode == "scipy":
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
-                optimized_posterior, history = gpx.fit_scipy(
-                    model=posterior,
-                    objective=self.objective,  # type: ignore
-                    train_data=self.data,
-                    max_iters=self.num_iters,
-                    verbose=self.verbosity >= 2,
-                )
+                try:
+                    optimized_posterior, history = gpx.fit_scipy(
+                        model=posterior,
+                        objective=self.objective,  # type: ignore
+                        train_data=self.data,
+                        max_iters=self.num_iters,
+                        verbose=self.verbosity >= 2,
+                    )
+                except FailedScipyFitError:
+                    optimized_posterior, history = posterior, [np.inf]
+
         elif self.fitting_mode == "adam":
             static_tree = tree_map(lambda x: not x, posterior.trainables)
             optim = ox.chain(
@@ -300,18 +326,18 @@ class KernelSearch:
         node : Node
             Current Node instance to expand.
         """
-        for kernel_operation in [gpx.kernels.ProductKernel, gpx.kernels.SumKernel]:
+        for kernel_operation in [ProductKernel, SumKernel]:
             for ker in self.kernel_library:
                 kernel = deepcopy(node.posterior.prior.kernel)
-
                 new_kernel = deepcopy(ker)  # type: ignore
-                if kernel_operation == gpx.kernels.SumKernel:
-                    # create new additive term with tracer constant,
-                    # the first kernel in the new term has a trainable constant
-                    new_kernel = gpx.kernels.ProductKernel(
-                        kernels=[self._const_kernel(), new_kernel]
-                    )  # type: ignore
-                if kernel_operation == gpx.kernels.ProductKernel:
+
+                if kernel_operation == SumKernel:
+                    # create new additive term
+                    composite_kernels = [
+                        kernel_operation(kernels=[kernel, new_kernel])
+                    ]  # type: ignore
+
+                elif kernel_operation == ProductKernel:
                     # further kernels have variance fixed, so that we only
                     # have one multiplicative constant per term
                     try:
@@ -321,16 +347,37 @@ class KernelSearch:
                     except ValueError:
                         pass
 
-                composite_kernel = kernel_operation(
-                    kernels=[kernel, new_kernel]
-                )  # type: ignore
+                    # multiply each term inidivually, if current kernel
+                    # already is a sum
+                    if (
+                        isinstance(kernel, CombinationKernel)
+                        and kernel.operator == jnp.sum
+                    ):
+                        composite_kernels = []
+                        terms = kernel.kernels
+                        assert terms
+                        for i in range(len(terms)):
+                            new_terms = deepcopy(terms)
+                            new_terms[i] = kernel_operation(
+                                kernels=[new_terms[i], new_kernel]
+                            )
+                            composite_kernels.append(SumKernel(kernels=new_terms))
 
-                new_prior = gpx.gps.Prior(
-                    mean_function=node.posterior.prior.mean_function,
-                    kernel=composite_kernel,
-                )
-                new_posterior = self.likelihood * new_prior
-                node.add_child(Node(new_posterior, parent=node))
+                    else:
+                        composite_kernels = [
+                            kernel_operation(kernels=[kernel, new_kernel])
+                        ]  # type: ignore
+                else:
+                    raise RuntimeError
+
+                for composite_kernel in composite_kernels:
+                    new_prior = gpx.gps.Prior(
+                        mean_function=node.posterior.prior.mean_function,
+                        kernel=composite_kernel,
+                    )
+
+                    new_posterior = self.likelihood * new_prior
+                    node.add_child(Node(new_posterior, parent=node))
 
     def compute_layer(
         self,
@@ -353,25 +400,24 @@ class KernelSearch:
             desc=f"Fitting Layer {current_depth +1}",
             disable=False if self.verbosity == 1 else True,
         ):
-            node.update(*self.fit(node.posterior), self.data.n)
+            if self.verbosity >= 2:
+                print(
+                    f"Current kernel: {self._kernel_name(node.posterior.prior.kernel)}"
+                )
+            node.update(*self.fit(node.posterior))
 
     def select_top_nodes(
         self,
         layer: list[Node],
-        bic_threshold: float,
         n_leafs: int,
     ) -> list[Node]:
         """Select top nodes of current layer, based on
-        their BIC value.
+        their AIC value.
 
         Parameters
         ----------
         layer : list[Node]
             List of nodes in the current layer.
-        bic_threshold : float
-            Maximum BIC nodes that to hit to be considered
-            for next layer. Usually minimum (best) BIC of
-            previous layer.
         n_leafs : int
             Number top nodes to keep.
 
@@ -381,12 +427,10 @@ class KernelSearch:
             Sorted list of top nodes.
         """
         # sort with id in tuple, so that no errors is thrown if multiple
-        # BIC are the same
-        sorted_tuple = sorted((node.bic, id(node), node) for node in layer)
+        # AIC are the same
+        sorted_tuple = sorted((node.aic, id(node), node) for node in layer)
         # return first n_leafs nodes
         top_nodes = [node for _, _, node in sorted_tuple][:n_leafs]
-        # filter for bic threshold
-        # top_nodes = [node for node in top_nodes if node.bic < bic_threshold]
         return top_nodes
 
     def expand_layer(
@@ -422,7 +466,7 @@ class KernelSearch:
         combinations.
         Start with simple kernel, which gets progressively more
         complex by adding or multiplying new kernels from kernel
-        library. Kernels are evaluated by calculating their BIC
+        library. Kernels are evaluated by calculating their AIC
         after being fit to data.
 
         Parameters
@@ -432,7 +476,7 @@ class KernelSearch:
             correspond to more complex kernels, by default 10
         n_leafs : int, optional
             The number of kernels to keep and expand at each layer. Top
-            kernels are chosen based on BIC, by default 3
+            kernels are chosen based on AIC, by default 3
         patience : int, optional
             Number of layers to calculate without improving before early
             stopping, by default 1
@@ -446,24 +490,24 @@ class KernelSearch:
 
         best_model = None
         current_depth = 0
-        bic_threshold = np.inf
+        aic_threshold = np.inf
         patience_counter = 0
         for current_depth in range(depth):
-            # fit and compute BIC at current layer
+            # fit and compute AIC at current layer
             self.compute_layer(layer, current_depth)
             if current_depth == 0:
-                best_model = sorted((node.bic, id(node), node) for node in layer)[0][-1]
+                best_model = sorted((node.aic, id(node), node) for node in layer)[0][-1]
 
-            # calculate and sort BICs
-            current_bics = sorted([node.bic for node in layer])
+            # calculate and sort AICs
+            current_aics = sorted([node.aic for node in layer])
             if self.verbosity >= 1:
-                print(f"Layer {current_depth+1} || Current BICs: {current_bics}")
+                print(f"Layer {current_depth+1} || Current AICs: {current_aics}")
 
             # select best mdeols
-            layer = self.select_top_nodes(layer, bic_threshold, n_leafs)
+            layer = self.select_top_nodes(layer, n_leafs)
 
             # Early stopping if no more improvements are found
-            if current_bics[0] > bic_threshold:
+            if current_aics[0] > aic_threshold:
                 if patience_counter >= patience:
                     if self.verbosity >= 1:
                         print("No more improvements found! Terminating early..\n")
@@ -471,7 +515,7 @@ class KernelSearch:
                 patience_counter += 1
             else:
                 best_model = layer[0]
-                bic_threshold = current_bics[0]  # min bic of current layer
+                aic_threshold = current_aics[0]  # min Aic of current layer
                 patience_counter = 0
 
             # expand tree and search for new top noded in next layer down
