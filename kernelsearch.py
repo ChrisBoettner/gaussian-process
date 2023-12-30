@@ -146,7 +146,6 @@ class KernelSearch:
         objective : Optional[gpx.objectives.AbstractObjective  |  Wrapped], optional
             The objective function used to evalute the quality of a fit. By default
             None, which defaults to the jit-compiled marginal log likelihood.
-            probability.
         mean_function : Optional[gpx.mean_functions.AbstractMeanFunction], optional
             The mean function of the Gaussian process. By default None, which
             sets the mean to zero.
@@ -204,11 +203,10 @@ class KernelSearch:
             for kernel in (kernel_library if root_kernel is None else [root_kernel])
         ]
 
-    @staticmethod
-    def _kernel_name(kernel: gpx.kernels.AbstractKernel) -> str:
-        """Generate string description of current kernel. Only
-        works with the specific type of structure created in
-        kernel tree search.
+    def _kernel_name(self, kernel: gpx.kernels.AbstractKernel) -> str:
+        """
+        Generate string description of current kernel. Works with nested
+        CombinationKernels in the kernel tree.
 
         Parameters
         ----------
@@ -220,34 +218,23 @@ class KernelSearch:
         str
             String description of kernel.
         """
+
+        def get_kernel_name(k: gpx.kernels.AbstractKernel) -> str:
+            if isinstance(k, CombinationKernel):
+                assert k.kernels
+                sub_names = [self._kernel_name(sub_k) for sub_k in k.kernels]
+                return f"({' * '.join(sub_names)})"
+            else:
+                return "Const" if hasattr(k, "constant") else f"{k.name}"
+
         if hasattr(kernel, "kernels"):
-            assert isinstance(kernel.kernels, list)  # type: ignore
-            name = ""
-
-            for term in kernel.kernels:  # type: ignore
-                if isinstance(term, CombinationKernel):
-                    for k in term.kernels:  # type: ignore
-                        try:
-                            name += "Const" if hasattr(k, "constant") else f"{k.name}"
-                        except AttributeError:
-                            raise ValueError("Kernel structure not understood - 1.")
-                        if k != term.kernels[-1]:  # type: ignore
-                            name += " * "
-                else:
-                    name = name + f"{term.name}"
-
-                if term != kernel.kernels[-1]:  # type: ignore
-                    if kernel.operator == jnp.sum:  # type: ignore
-                        name += " + "
-                    elif kernel.operator == jnp.prod:  # type: ignore
-                        name += " * "
-                    else:
-                        raise ValueError("Kernel structure not understood - 2.")
-
+            terms = [get_kernel_name(term) for term in kernel.kernels]  # type: ignore
+            op_symbol = " + " if kernel.operator == jnp.sum else " * "  # type: ignore
+            name = op_symbol.join(terms)
         elif hasattr(kernel, "name"):
             name = kernel.name
         else:
-            raise ValueError("Kernel structure not understood - 3.")
+            raise ValueError("Kernel structure not understood.")
         return name
 
     def fit(

@@ -38,8 +38,8 @@ class CombinationKernel(AbstractKernel):
 
     def __call__(
         self,
-        x: Float[Array, " D"],
-        y: Float[Array, " D"],
+        x: Float[Array, " D"],  # type: ignore
+        y: Float[Array, " D"],  # type: ignore
     ) -> ScalarFloat:
         r"""Evaluate the kernel on a pair of inputs.
 
