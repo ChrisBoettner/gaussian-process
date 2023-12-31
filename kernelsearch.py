@@ -4,9 +4,7 @@ from typing import Optional
 
 import jax.numpy as jnp
 import jax.random as jr
-import numpy as np
 import optax as ox
-from gpjax.base import meta_leaves
 from jax import config, jit, tree_map
 from jax.flatten_util import ravel_pytree
 from jax.stages import Wrapped
@@ -14,6 +12,8 @@ from jaxtyping import Array, install_import_hook
 from numpy.typing import NDArray
 from tqdm import tqdm
 from gpjax.fit import FailedScipyFitError
+from gpjax.base import meta_map
+from beartype.typing import Callable
 
 from kernels import CombinationKernel, ProductKernel, SumKernel
 
@@ -36,7 +36,7 @@ class Node:
         max_log_likelihood: Optional[float] = None,
         parent: Optional["Node"] = None,
     ) -> None:
-        """Node of the search tree, containg the posterior
+        """Node of the search tree, containing the posterior
         model.
 
         Parameters
@@ -51,12 +51,113 @@ class Node:
         self.children: list["Node"] = []
         self.parent = parent
 
-        self.update(
+        self._update_node(
             posterior,
             max_log_likelihood,
         )
 
-    def update(
+    def describe_kernel(self) -> str:
+        """Print kernel structure.
+
+        Returns
+        -------
+        str
+            The string description of the kernel.
+        """
+        kernel_structure = _kernel_name(self.posterior.prior.kernel)
+        return kernel_structure
+
+    def get_trainables(self, unconstrain: bool = False) -> Array:
+        """Print values of trainable parameter
+        of model.
+
+        Parameters
+        ----------
+        unconstrain : bool, optional
+            If True, model parameter are pushed trough bijector first
+            making their support encompass the entire real line, by
+            default False
+
+        Returns
+        -------
+        Array
+            List of trainable parameter values.
+        """
+        posterior = self.posterior
+        if unconstrain:
+            posterior = posterior.unconstrain()
+
+        all_params = ravel_pytree(posterior)[0]
+        trainable_mask = ravel_pytree(self.posterior.trainables())[0]
+        return all_params[trainable_mask]
+
+    def update_trainables(
+        self,
+        parameter: tuple | list | Array | NDArray,
+        unconstrain: bool = False,
+    ) -> gpx.gps.AbstractPosterior:
+        """Returns posterior with updated trainable parameter.
+
+        IMPORTANT: New model is returned but not automatically
+        assigned to the posterior attribute.
+
+        Parameters
+        ----------
+        parameter : tuple | list | Array | NDArray
+            The list of new parameter. Must be of same length
+            as the number of trainable parameter
+        unconstrain : bool, optional
+            If True, model parameter are pushed trough bijector first
+            making their support encompass the entire real line. The given
+            parameter list must then be in this unconstrained space, by
+            default False
+
+        Returns
+        -------
+        gpx.gps.AbstractPosterior
+            The posterior with updated parameter.
+        """
+
+        def create_parameter_updater() -> Callable:
+            # Check if the number of trainable parameters matches the length
+            # of the parameter list
+            num_trainable_params = sum(ravel_pytree(self.posterior.trainables())[0])
+            if len(parameter) != num_trainable_params:
+                raise ValueError(
+                    f"The length of the parameter list ({len(parameter)}) must "
+                    "match the number of trainable parameters "
+                    f"({num_trainable_params}) in the model."
+                )
+
+            # create iterable iterates through values in parameter list
+            # everytime its called
+            param_iterator = iter(parameter)
+
+            # filter leaves, and assign new parameter from parameter list
+            # if trainable is found
+            def update_trainable(meta_leaf: tuple[dict, Array]) -> Array:
+                meta, leaf = meta_leaf
+                if meta.get("trainable", False):
+                    try:
+                        return jnp.array(next(param_iterator))
+                    except StopIteration:
+                        raise IndexError(
+                            "Found more parameter in paramter list than "
+                            "trainable parameters in model."
+                        )
+                else:
+                    return leaf
+
+            return update_trainable
+
+        updater = create_parameter_updater()
+
+        posterior = self.posterior
+        if unconstrain:
+            posterior = posterior.unconstrain()
+        return meta_map(updater, posterior)  # type: ignore
+
+    def _update_node(
         self,
         posterior: gpx.gps.AbstractPosterior,
         max_log_likelihood: Optional[float] = None,
@@ -76,26 +177,13 @@ class Node:
         """
         self.posterior = posterior
 
-        # try:
-        #     leaves = meta_leaves(
-        #         posterior.prior.kernel.flattened_kernels  # type: ignore
-        #     )
-        # except AttributeError:
-        #     leaves = meta_leaves(posterior.prior.kernel)
-        # self.n_parameter = sum(
-        #     leaf[0]["trainable"] for leaf in leaves if isinstance(leaf[0], dict)
-        # )  # number of trainable parameter
-        # # add std, if its being fit
-        # self.n_parameter += meta_leaves(posterior.likelihood)[0][0][  # type: ignore
-        #     "trainable"
-        # ]
         self.n_parameter = sum(ravel_pytree(posterior.trainables())[0])
 
         if max_log_likelihood is not None:
             self.max_log_likelihood = max_log_likelihood
             self.aic = self.n_parameter * 2 - 2 * self.max_log_likelihood
 
-    def add_child(
+    def _add_child(
         self,
         node: "Node",
     ) -> None:
@@ -205,40 +293,6 @@ class KernelSearch:
             for kernel in (kernel_library if root_kernel is None else [root_kernel])
         ]
 
-    def _kernel_name(self, kernel: gpx.kernels.AbstractKernel) -> str:
-        """
-        Generate string description of current kernel. Works with nested
-        CombinationKernels in the kernel tree.
-
-        Parameters
-        ----------
-        kernel : AbstractKernel
-            The kernel.
-
-        Returns
-        -------
-        str
-            String description of kernel.
-        """
-
-        def get_kernel_name(k: gpx.kernels.AbstractKernel) -> str:
-            if isinstance(k, CombinationKernel):
-                assert k.kernels
-                sub_names = [self._kernel_name(sub_k) for sub_k in k.kernels]
-                return f"({' * '.join(sub_names)})"
-            else:
-                return "Const" if hasattr(k, "constant") else f"{k.name}"
-
-        if hasattr(kernel, "kernels"):
-            terms = [get_kernel_name(term) for term in kernel.kernels]  # type: ignore
-            op_symbol = " + " if kernel.operator == jnp.sum else " * "  # type: ignore
-            name = op_symbol.join(terms)
-        elif hasattr(kernel, "name"):
-            name = kernel.name
-        else:
-            raise ValueError("Kernel structure not understood.")
-        return name
-
     def fit(
         self, posterior: gpx.gps.AbstractPosterior
     ) -> tuple[gpx.gps.AbstractPosterior, float]:
@@ -274,7 +328,7 @@ class KernelSearch:
                         verbose=self.verbosity >= 2,
                     )
                 except FailedScipyFitError:
-                    optimized_posterior, history = posterior, [np.inf]
+                    optimized_posterior, history = posterior, [jnp.inf]
 
         elif self.fitting_mode == "adam":
             static_tree = tree_map(lambda x: not x, posterior.trainables)
@@ -298,8 +352,8 @@ class KernelSearch:
             raise ValueError("'fitting_mode' must be 'scipy' or 'adam'.")
 
         max_log_likelihood = -float(history[-1])
-        if not np.isfinite(max_log_likelihood):
-            max_log_likelihood = -np.inf
+        if not jnp.isfinite(max_log_likelihood):
+            max_log_likelihood = -jnp.inf
 
         return optimized_posterior, max_log_likelihood
 
@@ -366,7 +420,7 @@ class KernelSearch:
                     )
 
                     new_posterior = self.likelihood * new_prior
-                    node.add_child(Node(new_posterior, parent=node))
+                    node._add_child(Node(new_posterior, parent=node))
 
     def compute_layer(
         self,
@@ -390,10 +444,8 @@ class KernelSearch:
             disable=False if self.verbosity == 1 else True,
         ):
             if self.verbosity >= 2:
-                print(
-                    f"Current kernel: {self._kernel_name(node.posterior.prior.kernel)}"
-                )
-            node.update(*self.fit(node.posterior))
+                print(f"Current kernel: {_kernel_name(node.posterior.prior.kernel)}")
+            node._update_node(*self.fit(node.posterior))
 
     def select_top_nodes(
         self,
@@ -449,7 +501,7 @@ class KernelSearch:
         depth: int = 10,
         n_leafs: int = 3,
         patience: int = 1,
-    ) -> gpx.gps.AbstractPosterior:
+    ) -> Node:
         """Search for the best kernel fitting the data
         by performing a greedy search through possible kernel
         combinations.
@@ -473,13 +525,14 @@ class KernelSearch:
         Returns
         -------
         gpx.gps.AbstractPosterior
-            The (fitted) gpjax posterior object for the best kernel.
+            The node containing the (fitted) gpjax posterior object
+            for the best kernel.
         """
         layer = self.root
 
         best_model = None
         current_depth = 0
-        aic_threshold = np.inf
+        aic_threshold = jnp.inf
         patience_counter = 0
         for current_depth in range(depth):
             # fit and compute AIC at current layer
@@ -488,7 +541,7 @@ class KernelSearch:
                 best_model = sorted((node.aic, id(node), node) for node in layer)[0][-1]
 
             # calculate and sort AICs
-            current_aics = sorted([node.aic for node in layer])
+            current_aics = sorted([float(node.aic) for node in layer])
             if self.verbosity >= 1:
                 print(f"Layer {current_depth+1} || Current AICs: {current_aics}")
 
@@ -517,4 +570,40 @@ class KernelSearch:
             print(f"Terminated on layer: {current_depth+1}.")
             print(f"Final log likelihood: {best_model.max_log_likelihood}")
             print(f"Final number of model paramter: {best_model.n_parameter}")
-        return best_model.posterior
+        return best_model
+
+
+def _kernel_name(kernel: gpx.kernels.AbstractKernel) -> str:
+    """
+    Generate string description of current kernel. Works with nested
+    CombinationKernels in the kernel tree, but only those created
+    explicity be the kernel search and its particular structure.
+
+    Parameters
+    ----------
+    kernel : AbstractKernel
+        The kernel.
+
+    Returns
+    -------
+    str
+        String description of kernel.
+    """
+
+    def get_kernel_name(k: gpx.kernels.AbstractKernel) -> str:
+        if isinstance(k, CombinationKernel):
+            assert k.kernels
+            sub_names = [_kernel_name(sub_k) for sub_k in k.kernels]
+            return f"({' * '.join(sub_names)})"
+        else:
+            return "Const" if hasattr(k, "constant") else f"{k.name}"
+
+    if hasattr(kernel, "kernels"):
+        terms = [get_kernel_name(term) for term in kernel.kernels]  # type: ignore
+        op_symbol = " + " if kernel.operator == jnp.sum else " * "  # type: ignore
+        name = op_symbol.join(terms)
+    elif hasattr(kernel, "name"):
+        name = kernel.name
+    else:
+        raise ValueError("Kernel structure not understood.")
+    return name
