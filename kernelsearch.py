@@ -5,15 +5,16 @@ from typing import Optional
 import jax.numpy as jnp
 import jax.random as jr
 import optax as ox
+from beartype.typing import Callable
+from gpjax.base import meta_map
+from gpjax.fit import FailedScipyFitError
 from jax import config, jit, tree_map
 from jax.flatten_util import ravel_pytree
 from jax.stages import Wrapped
+from jax.tree_util import tree_leaves, tree_structure
 from jaxtyping import Array, install_import_hook
 from numpy.typing import NDArray
 from tqdm import tqdm
-from gpjax.fit import FailedScipyFitError
-from gpjax.base import meta_map
-from beartype.typing import Callable
 
 from kernels import CombinationKernel, ProductKernel, SumKernel
 
@@ -57,15 +58,22 @@ class Node:
         )
 
     def describe_kernel(self) -> str:
-        """Print kernel structure.
+        """
+        Generate string description of current kernel. Works with nested
+        CombinationKernels in the kernel tree, but only those created
+        explicity be the kernel search and its particular structure.
+
+        Parameters
+        ----------
+        kernel : AbstractKernel
+            The kernel.
 
         Returns
         -------
         str
-            The string description of the kernel.
+            String description of kernel.
         """
-        kernel_structure = _kernel_name(self.posterior.prior.kernel)
-        return kernel_structure
+        return describe_kernel(self.posterior.prior.kernel)
 
     def get_trainables(self, unconstrain: bool = False) -> Array:
         """Print values of trainable parameter
@@ -73,6 +81,8 @@ class Node:
 
         Parameters
         ----------
+        posterior : gpx.gps.AbstractPosterior
+                The gpjax posterior model.
         unconstrain : bool, optional
             If True, model parameter are pushed trough bijector first
             making their support encompass the entire real line, by
@@ -83,26 +93,19 @@ class Node:
         Array
             List of trainable parameter values.
         """
-        posterior = self.posterior
-        if unconstrain:
-            posterior = posterior.unconstrain()
-
-        all_params = ravel_pytree(posterior)[0]
-        trainable_mask = ravel_pytree(self.posterior.trainables())[0]
-        return all_params[trainable_mask]
+        return get_trainables(self.posterior, unconstrain)
 
     def update_trainables(
         self,
         parameter: tuple | list | Array | NDArray,
         unconstrain: bool = False,
-    ) -> gpx.gps.AbstractPosterior:
-        """Returns posterior with updated trainable parameter.
-
-        IMPORTANT: New model is returned but not automatically
-        assigned to the posterior attribute.
+    ) -> None:
+        """Update posterior with new trainable parameter.
 
         Parameters
         ----------
+        posterior : gpx.gps.AbstractPosterior
+                The gpjax posterior model.
         parameter : tuple | list | Array | NDArray
             The list of new parameter. Must be of same length
             as the number of trainable parameter
@@ -112,50 +115,10 @@ class Node:
             parameter list must then be in this unconstrained space, by
             default False
 
-        Returns
-        -------
-        gpx.gps.AbstractPosterior
-            The posterior with updated parameter.
         """
-
-        def create_parameter_updater() -> Callable:
-            # Check if the number of trainable parameters matches the length
-            # of the parameter list
-            num_trainable_params = sum(ravel_pytree(self.posterior.trainables())[0])
-            if len(parameter) != num_trainable_params:
-                raise ValueError(
-                    f"The length of the parameter list ({len(parameter)}) must "
-                    "match the number of trainable parameters "
-                    f"({num_trainable_params}) in the model."
-                )
-
-            # create iterable iterates through values in parameter list
-            # everytime its called
-            param_iterator = iter(parameter)
-
-            # filter leaves, and assign new parameter from parameter list
-            # if trainable is found
-            def update_trainable(meta_leaf: tuple[dict, Array]) -> Array:
-                meta, leaf = meta_leaf
-                if meta.get("trainable", False):
-                    try:
-                        return jnp.array(next(param_iterator))
-                    except StopIteration:
-                        raise IndexError(
-                            "Found more parameter in paramter list than "
-                            "trainable parameters in model."
-                        )
-                else:
-                    return leaf
-
-            return update_trainable
-
-        updater = create_parameter_updater()
-
-        posterior = self.posterior
-        if unconstrain:
-            posterior = posterior.unconstrain()
-        return meta_map(updater, posterior)  # type: ignore
+        self.posterior: gpx.gps.AbstractPosterior = set_trainables(
+            self.posterior, parameter, unconstrain
+        )
 
     def _update_node(
         self,
@@ -444,7 +407,7 @@ class KernelSearch:
             disable=False if self.verbosity == 1 else True,
         ):
             if self.verbosity >= 2:
-                print(f"Current kernel: {_kernel_name(node.posterior.prior.kernel)}")
+                print(f"Current kernel: {describe_kernel(node.posterior.prior.kernel)}")
             node._update_node(*self.fit(node.posterior))
 
     def select_top_nodes(
@@ -501,7 +464,7 @@ class KernelSearch:
         depth: int = 10,
         n_leafs: int = 3,
         patience: int = 1,
-    ) -> Node:
+    ) -> gpx.gps.AbstractPosterior:
         """Search for the best kernel fitting the data
         by performing a greedy search through possible kernel
         combinations.
@@ -525,7 +488,7 @@ class KernelSearch:
         Returns
         -------
         gpx.gps.AbstractPosterior
-            The node containing the (fitted) gpjax posterior object
+            The fitted gpjax posterior object
             for the best kernel.
         """
         layer = self.root
@@ -570,10 +533,14 @@ class KernelSearch:
             print(f"Terminated on layer: {current_depth+1}.")
             print(f"Final log likelihood: {best_model.max_log_likelihood}")
             print(f"Final number of model paramter: {best_model.n_parameter}")
-        return best_model
+        return best_model.posterior
 
 
-def _kernel_name(kernel: gpx.kernels.AbstractKernel) -> str:
+def describe_kernel(
+    kernel: gpx.kernels.AbstractKernel
+    | gpx.gps.AbstractPosterior
+    | gpx.gps.AbstractPrior,
+) -> str:
     """
     Generate string description of current kernel. Works with nested
     CombinationKernels in the kernel tree, but only those created
@@ -581,19 +548,32 @@ def _kernel_name(kernel: gpx.kernels.AbstractKernel) -> str:
 
     Parameters
     ----------
-    kernel : AbstractKernel
-        The kernel.
+    kernel :  gpx.kernels.AbstractKernel
+            | gpx.gps.AbstractPosterior
+            | gpx.gps.AbstractPrior
+        The kernel to be described. Can also pass posterior or
+        prior object, in which case the associated kernel is
+        described.
 
     Returns
     -------
     str
         String description of kernel.
     """
+    if isinstance(kernel, gpx.gps.AbstractPosterior):
+        kernel = kernel.prior.kernel
+    elif isinstance(kernel, gpx.gps.AbstractPrior):
+        kernel = kernel.kernel
+    elif isinstance(kernel, gpx.kernels.AbstractKernel):
+        pass
+    else:
+        raise ValueError("'kernel' must be kernel, prior or posterior instance.")
+    assert isinstance(kernel, gpx.kernels.AbstractKernel)
 
     def get_kernel_name(k: gpx.kernels.AbstractKernel) -> str:
         if isinstance(k, CombinationKernel):
             assert k.kernels
-            sub_names = [_kernel_name(sub_k) for sub_k in k.kernels]
+            sub_names = [describe_kernel(sub_k) for sub_k in k.kernels]
             return f"({' * '.join(sub_names)})"
         else:
             return "Const" if hasattr(k, "constant") else f"{k.name}"
@@ -607,3 +587,128 @@ def _kernel_name(kernel: gpx.kernels.AbstractKernel) -> str:
     else:
         raise ValueError("Kernel structure not understood.")
     return name
+
+
+def get_trainables(
+    posterior: gpx.gps.AbstractPosterior,
+    unconstrain: bool = False,
+) -> Array:
+    """Print values of trainable parameter
+    of model.
+
+    Parameters
+    ----------
+    posterior : gpx.gps.AbstractPosterior
+            The gpjax posterior model.
+    unconstrain : bool, optional
+        If True, model parameter are pushed trough bijector first
+        making their support encompass the entire real line, by
+        default False
+
+    Returns
+    -------
+    Array
+        List of trainable parameter values.
+    """
+    if unconstrain:
+        posterior = posterior.unconstrain()
+
+    all_params = ravel_pytree(posterior)[0]
+    trainable_mask = ravel_pytree(posterior.trainables())[0]
+    return all_params[trainable_mask]
+
+
+def set_trainables(
+    posterior: gpx.gps.AbstractPosterior,
+    parameter: tuple | list | Array | NDArray,
+    unconstrain: bool = False,
+) -> gpx.gps.AbstractPosterior:
+    """Returns posterior with updated trainable parameter.
+
+    Parameters
+    ----------
+    posterior : gpx.gps.AbstractPosterior
+            The gpjax posterior model.
+    parameter : tuple | list | Array | NDArray
+        The list of new parameter. Must be of same length
+        as the number of trainable parameter
+    unconstrain : bool, optional
+        If True, model parameter are pushed trough bijector first
+        making their support encompass the entire real line. The given
+        parameter list must then be in this unconstrained space, by
+        default False
+
+    Returns
+    -------
+    gpx.gps.AbstractPosterior
+        The posterior with updated parameter.
+    """
+
+    def create_parameter_updater() -> Callable:
+        # Check if the number of trainable parameters matches the length
+        # of the parameter list
+        num_trainable_params = sum(ravel_pytree(posterior.trainables())[0])
+        if len(parameter) != num_trainable_params:
+            raise ValueError(
+                f"The length of the parameter list ({len(parameter)}) must "
+                "match the number of trainable parameters "
+                f"({num_trainable_params}) in the model."
+            )
+
+        # create iterable iterates through values in parameter list
+        # everytime its called
+        param_iterator = iter(parameter)
+
+        # filter leaves, and assign new parameter from parameter list
+        # if trainable is found
+        def update_trainable(meta_leaf: tuple[dict, Array]) -> Array:
+            meta, leaf = meta_leaf
+            if meta.get("trainable", False):
+                try:
+                    return jnp.array(next(param_iterator))
+                except StopIteration:
+                    raise IndexError(
+                        "Found more parameter in paramter list than "
+                        "trainable parameters in model."
+                    )
+            else:
+                return leaf
+
+        return update_trainable
+
+    updater = create_parameter_updater()
+
+    if unconstrain:
+        posterior = posterior.unconstrain()
+    return meta_map(updater, posterior)  # type: ignore
+
+
+@jit
+def jit_set_trainables(
+    posterior: gpx.gps.AbstractPosterior, parameter: Array, trainable_idx: Array
+) -> gpx.gps.AbstractPosterior:
+    """A jit-compatible version of set_trainables. For this, the indices of the
+    trainable parameter must be given explicitly. There's no initial check of
+    lengths, so make sure the length of the parameter array is the same as the
+    number of trainable parameter.
+
+    Parameters
+    ----------
+    posterior : gpx.gps.AbstractPosterior
+            The gpjax posterior model.
+    parameter : Array
+        The array of new parameter. Must be of same length
+        as the number of trainable parameter, and a jnp array.
+    trainable_idx : Array
+        A jnp array containing the indices of the trainable parameter.
+
+    Returns
+    -------
+    gpx.gps.AbstractPosterior
+        The posterior with updated parameter.
+    """
+    old_parameter = jnp.array(tree_leaves(posterior))
+    updated_parameter = old_parameter.at[trainable_idx].set(parameter)
+
+    new_posterior = tree_structure(posterior).unflatten(updated_parameter)
+    return new_posterior

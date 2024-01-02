@@ -56,8 +56,8 @@ class CombinationKernel(AbstractKernel):
         return self.operator(jnp.stack([k(x, y) for k in self.kernels]))
 
 
-SumKernel = partial(CombinationKernel, operator=jnp.sum)
-ProductKernel = partial(CombinationKernel, operator=jnp.prod)
+SumKernel = partial(CombinationKernel, operator=jnp.sum)  # type: ignore
+ProductKernel = partial(CombinationKernel, operator=jnp.prod)  # type: ignore
 
 
 @dataclass
