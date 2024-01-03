@@ -432,9 +432,8 @@ class KernelSearch:
         """
         # sort with id in tuple, so that no errors is thrown if multiple
         # AIC are the same
-        sorted_tuple = sorted((node.aic, id(node), node) for node in layer)
+        top_nodes = sorted(layer, key=lambda node: (node.aic, id(node)))[:n_leafs]
         # return first n_leafs nodes
-        top_nodes = [node for _, _, node in sorted_tuple][:n_leafs]
         return top_nodes
 
     def expand_layer(
@@ -464,7 +463,8 @@ class KernelSearch:
         depth: int = 10,
         n_leafs: int = 3,
         patience: int = 1,
-    ) -> gpx.gps.AbstractPosterior:
+        return_all: bool = False,
+    ) -> gpx.gps.AbstractPosterior | tuple[gpx.gps.AbstractPosterior, list[Node]]:
         """Search for the best kernel fitting the data
         by performing a greedy search through possible kernel
         combinations.
@@ -484,14 +484,24 @@ class KernelSearch:
         patience : int, optional
             Number of layers to calculate without improving before early
             stopping, by default 1
+        return_full : bool, optional
+            If True, return all nodes computed in the tree sorted by their
+            AIC value. Use node.posterior to access posterior, by default
+            False
 
         Returns
         -------
         gpx.gps.AbstractPosterior
             The fitted gpjax posterior object
             for the best kernel.
+        list[Node]
+            A list of all nodes that were computed in the tree (including)
+            their posteriors, sorted by their AIC value. Only returned
+            if return_full is True
+
         """
         layer = self.root
+        all_nodes = []
 
         best_model = None
         current_depth = 0
@@ -501,7 +511,8 @@ class KernelSearch:
             # fit and compute AIC at current layer
             self.compute_layer(layer, current_depth)
             if current_depth == 0:
-                best_model = sorted((node.aic, id(node), node) for node in layer)[0][-1]
+                best_model = sorted(layer, key=lambda node: (node.aic, id(node)))[-1]
+            all_nodes.extend(layer)
 
             # calculate and sort AICs
             current_aics = sorted([float(node.aic) for node in layer])
@@ -532,7 +543,12 @@ class KernelSearch:
         if self.verbosity >= 1:
             print(f"Terminated on layer: {current_depth+1}.")
             print(f"Final log likelihood: {best_model.max_log_likelihood}")
-            print(f"Final number of model paramter: {best_model.n_parameter}")
+            print(f"Final number of model parameter: {best_model.n_parameter}")
+
+        if return_all:
+            # sort all computed models
+            all_nodes = sorted(all_nodes, key=lambda node: (node.aic, id(node)))
+            return best_model.posterior, all_nodes
         return best_model.posterior
 
 
