@@ -28,7 +28,8 @@ def log_likelihood_function(
     The probability is calculated in the following way:
 
     - Calculate marginal probability for GP outside of transit
-    (background, using mask)
+    (background, using mask), this corresponds to the likelihood
+    of the GP hyperparameter
     - Remove model lightcurve
     - Calculate probability of light curve data after
     removing the transit (inverse mask), with the GP conditioned
@@ -108,7 +109,7 @@ def log_likelihood_function(
             # calculate probability under GP model
             res = (D_transit.y - lightcurve).reshape(-1)
             transit_log_prob = transit_dist.log_prob(res.reshape(-1))
-            # return (negative of, if wanted) log probabilitys
+            # return (negative of, if wanted) log probability
             return constant * jnp.nan_to_num(
                 transit_log_prob + background_log_prob, nan=-jnp.inf
             )
