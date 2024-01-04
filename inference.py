@@ -1,14 +1,15 @@
 import gpjax as gpx
 import jax
-from jax import jit
 import jax.numpy as jnp
-from beartype.typing import Callable
-from blackjax.progress_bar import progress_bar_scan
+import tensorflow_probability.substrates.jax as tfp
+from beartype.typing import Callable, NamedTuple
 from blackjax.base import SamplingAlgorithm
-from gpjax.typing import Array, ScalarFloat
-from jax.tree_util import tree_leaves
+from blackjax.progress_bar import progress_bar_scan
 from blackjax.types import ArrayLikeTree
-from beartype.typing import NamedTuple
+from gpjax.typing import Array, ScalarFloat
+from jax import jit
+from gpjax.objectives import ConjugateMLL
+from jax.tree_util import tree_leaves
 
 from kernelsearch import jit_set_trainables
 
@@ -25,10 +26,13 @@ def log_likelihood_function(
 ) -> Callable:
     """Create objective function for lightcurve fit.
     The probability is calculated in the following way:
-    - Fit GP outside of transit (masked input)
+
+    - Calculate marginal probability for GP outside of transit
+    (background, using mask)
     - Remove model lightcurve
-    - Calculate probability of remaining data under
-      fitted GP
+    - Calculate probability of light curve data after
+    removing the transit (inverse mask), with the GP conditioned
+    on the background data
 
     The returned Callable calculates the log probability
     for an input dict 'params', which must be a dictonary
@@ -66,53 +70,55 @@ def log_likelihood_function(
     """
     constant = jnp.array(-1.0) if negative else jnp.array(1.0)
 
-    # D = gpx.Dataset(
-    #     X=X.reshape(-1, 1),
-    #     y=y.reshape(-1, 1),
-    # )
-    D_masked = gpx.Dataset(
+    D_background = gpx.Dataset(
         X=X[mask].reshape(-1, 1),
         y=y[mask].reshape(-1, 1),
     )
-    D_inverse_masked = gpx.Dataset(
+    D_transit = gpx.Dataset(
         X=X[~mask].reshape(-1, 1),
         y=y[~mask].reshape(-1, 1),
     )
 
-    # indices of trainables for GP
-    trainable_idx = jnp.argwhere(
-        jnp.array(tree_leaves(gp_posterior.trainables()))
-    ).reshape(-1)
+    marginal_log_likelihood = ConjugateMLL()
 
     # fix gp variables to to initial values
     if fix_gp:
         # constrain the posterior
         updated_posterior = gp_posterior.constrain()
 
-        # calculate distribution of values predicted for all x values,
-        # under the masked observations
-        latent_dist = updated_posterior(
-            D_inverse_masked.X,
-            train_data=D_masked,
+        # marginal log likelihood for background,
+        # constitutes likelihood function for hyperparameter
+        # conditioned on data outside of transit
+        background_log_prob = marginal_log_likelihood(
+            updated_posterior,
+            D_background,
         )
-        predictive_dist = updated_posterior.likelihood(
-            latent_dist
-        )  # adds observational uncertainty
+
+        transit_dist = calculate_predictive_dist(
+            updated_posterior,
+            D_transit.X,  # type: ignore
+            D_background,
+        )
 
         def objective(params: Array) -> ScalarFloat:
             # calculate lightcurve model
-            lightcurve = lc_model(D_inverse_masked.X, params["lc_parameter"])
+            lightcurve = lc_model(D_transit.X, params["lc_parameter"])
 
             # remove lightcurve from observations and
             # calculate probability under GP model
-            res = (D_inverse_masked.y - lightcurve).reshape(-1)
-            log_prob = predictive_dist.log_prob(res)
-
-            # return (negative of, if wanted) log probability
-            return constant * jnp.nan_to_num(log_prob, nan=-jnp.inf)
+            res = (D_transit.y - lightcurve).reshape(-1)
+            transit_log_prob = transit_dist.log_prob(res.reshape(-1))
+            # return (negative of, if wanted) log probabilitys
+            return constant * jnp.nan_to_num(
+                transit_log_prob + background_log_prob, nan=-jnp.inf
+            )
 
     # adapt gp parameter at every step
     else:
+        # indices of trainables for GP
+        trainable_idx = jnp.argwhere(
+            jnp.array(tree_leaves(gp_posterior.trainables()))
+        ).reshape(-1)
 
         def objective(params: Array) -> ScalarFloat:
             # update the parameter of the posterior object
@@ -122,31 +128,71 @@ def log_likelihood_function(
                 trainable_idx,
             ).constrain()
 
-            # calculate distribution of values
-            # predicted for all x values, under
-            # the masked observations
-            latent_dist = updated_posterior(
-                D_inverse_masked.X,
-                train_data=D_masked,
+            # marginal log likelihood for background,
+            # constitutes likelihood function for hyperparameter
+            # conditioned on data outside of transit
+            background_log_prob = marginal_log_likelihood(
+                updated_posterior,
+                D_background,
             )
-            predictive_dist = updated_posterior.likelihood(
-                latent_dist
-            )  # adds observational uncertainty
 
+            transit_dist = calculate_predictive_dist(
+                updated_posterior,
+                D_transit.X,  # type: ignore
+                D_background,
+            )
             # calculate lightcurve model
-            lightcurve = lc_model(D_inverse_masked.X, params["lc_parameter"])
+            lightcurve = lc_model(D_transit.X, params["lc_parameter"])
 
             # remove lightcurve from observations and
             # calculate probability under GP model
-            res = (D_inverse_masked.y - lightcurve).reshape(-1)
-            log_prob = predictive_dist.log_prob(res)
+            res = D_transit.y - lightcurve
+            transit_log_prob = transit_dist.log_prob(res.reshape(-1))
 
             # return (negative of, if wanted) log probability
-            return constant * jnp.nan_to_num(log_prob, nan=-jnp.inf)
+            return constant * jnp.nan_to_num(
+                transit_log_prob + background_log_prob, nan=-jnp.inf
+            )
 
     if compile:
         return jit(objective)
     return objective
+
+
+@jit
+def calculate_predictive_dist(
+    posterior: gpx.gps.AbstractPosterior,
+    input: Array,
+    train_data: gpx.Dataset,
+) -> tfp.distributions.Distribution:
+    """Calculate the predictive distribution
+    of the GP for a given input (x data), under
+    the observations given by train_data.
+
+    Parameters
+    ----------
+    posterior : gpx.gps.AbstractPosterior
+        The GPJax posterior object.
+    input : Array
+        The (x) values at which to calculate the
+        distribution
+    train_data : gpx.Dataset
+        The training data to condition the GP on.
+
+    Returns
+    -------
+    tfp.distributions.Distribution
+        The predictive distribution. (Most likely
+        multivariate Gaussian)
+    """
+    latent_dist = posterior(
+        input,
+        train_data=train_data,
+    )
+    predictive_dist = posterior.likelihood(
+        latent_dist
+    )  # adds observational uncertainty
+    return predictive_dist
 
 
 def run_inference_algorithm(
