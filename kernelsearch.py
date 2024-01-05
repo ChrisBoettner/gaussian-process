@@ -213,7 +213,6 @@ class KernelSearch:
         verbosity : int, optional
             Verbosity of the output between 0 and 2, by default 1
         """
-
         if isinstance(obs_stddev, float):
             obs_stddev = jnp.array(obs_stddev)
 
@@ -229,6 +228,11 @@ class KernelSearch:
             objective = jit(gpx.objectives.ConjugateMLL(negative=True))
         if mean_function is None:
             mean_function = gpx.mean_functions.Zero()
+            # if not jnp.isclose(jnp.mean(y), 0):
+            #    raise ValueError(
+            #        "If no mean function is given, data must be centered at 0. "
+            #        "Please center data first using y - mean(y)."
+            #    )
 
         self.likelihood = likelihood
         self.objective = objective
