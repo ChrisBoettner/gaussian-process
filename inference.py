@@ -187,6 +187,9 @@ def calculate_predictive_dist(
         The predictive distribution. (Most likely
         multivariate Gaussian)
     """
+    if input.ndim == 1:
+        input = input.reshape(-1, 1)
+
     latent_dist = posterior(
         input,
         train_data=train_data,

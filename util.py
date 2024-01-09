@@ -1,19 +1,19 @@
 import jax.numpy as jnp
 import jax.random as jr
 from beartype.typing import Optional
-from jax import jit
 from jaxoplanet import orbits
 from jaxoplanet.light_curves import LimbDarkLightCurve
 from jaxtyping import Array
+from jax import jit
 
 rng_key = jr.PRNGKey(36)
 idx_key, noise_key = jr.split(rng_key, 2)
 
 
-@jit
 def calculate_example_lightcurve(
     t: Optional[Array] = None,
     noise_std: float = 0.001,
+    phi: float = 0,
     num_train: int = 150,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array]:
     if t is None:
@@ -31,7 +31,12 @@ def calculate_example_lightcurve(
 
     systematics = 0.002 * (5 * t**2 + jnp.sin(20 * t) + 0.3 * jnp.cos(50 * t))
 
-    noise = noise_std * jr.normal(noise_key, (len(t),))
+    white_noise = noise_std * jr.normal(noise_key, (len(t),))
+    noise = white_noise
+    noise = jnp.zeros(len(t))
+    noise = noise.at[0].set(white_noise[0])
+    for i in range(1, len(t)):  # generate ar(1) noise
+        noise = noise.at[i].set(phi * noise[i - 1] + white_noise[i])
 
     train_ind = jnp.sort(jr.choice(idx_key, len(t), (num_train,), replace=False))
 
@@ -51,3 +56,19 @@ def calculate_example_lightcurve(
         noise,
         mask,
     )
+
+
+@jit
+def lc_model(t: Array, log_params: Array) -> Array:
+    params = jnp.exp(log_params)
+
+    # The light curve calculation requires an orbit
+    orbit = orbits.keplerian.Body(
+        period=15,
+        radius=params[0],
+        inclination=jnp.deg2rad(89),
+        time_transit=0,
+    )
+
+    lc = LimbDarkLightCurve([params[1], params[2]]).light_curve(orbit, t=t)
+    return lc
